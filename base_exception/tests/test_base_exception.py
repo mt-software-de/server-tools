@@ -1,88 +1,108 @@
 # Copyright 2016 Akretion Mourad EL HADJ MIMOUNE
+# Copyright 2020 Hibou Corp.
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl.html).
 
-from odoo.tests import common
-from .common import setup_test_model
-from .purchase_test import PurchaseTest, LineTest
-import logging
 
-_logger = logging.getLogger(__name__)
+from odoo_test_helper import FakeModelLoader
+
+from odoo.exceptions import UserError, ValidationError
+from odoo.tests import SavepointCase
 
 
-@common.at_install(False)
-@common.post_install(True)
-class TestBaseException(common.SavepointCase):
-
-    # pylint: disable=missing-return
-
+class TestBaseException(SavepointCase):
     @classmethod
     def setUpClass(cls):
-        super(TestBaseException, cls).setUpClass()
-        setup_test_model(cls.env, [PurchaseTest, LineTest])
+        super().setUpClass()
 
-        cls.base_exception = cls.env['base.exception']
-        cls.exception_rule = cls.env['exception.rule']
-        cls.exception_confirm = cls.env['exception.rule.confirm']
+        cls.loader = FakeModelLoader(cls.env, cls.__module__)
+        cls.loader.backup_registry()
+        from .purchase_test import ExceptionRule, LineTest, PurchaseTest
 
-        cls.exception_rule._fields['rule_group'].selection.append(
-            ('test_base', 'test base exception')
-        )
-        cls.exception_rule._fields['model'].selection.append(
-            ('base.exception.test.purchase',
-             'base.exception.test.purchase')
-        )
-        cls.exception_rule._fields['model'].selection.append(
-            ('base.exception.test.purchase.line',
-             'base.exception.test.purchase.line')
-        )
-        cls.exceptionnozip = cls.env['exception.rule'].create({
-            'name': "No ZIP code on destination",
-            'sequence': 10,
-            'rule_group': "test_base",
-            'model': "base.exception.test.purchase",
-            'code': """if not test_base.partner_id.zip:
-    failed=True""",
-        })
-        cls.exceptionno_minorder = cls.env['exception.rule'].create({
-            'name': "Min order except",
-            'sequence': 10,
-            'rule_group': "test_base",
-            'model': "base.exception.test.purchase",
-            'code': """if test_base.amount_total <= 200.0:
-    failed=True""",
-        })
+        cls.loader.update_registry((ExceptionRule, LineTest, PurchaseTest))
 
-        cls.exceptionno_lineqty = cls.env['exception.rule'].create({
-            'name': "Qty > 0",
-            'sequence': 10,
-            'rule_group': "test_base",
-            'model': "base.exception.test.purchase.line",
-            'code': """if test_base_line.qty <= 0:
-        failed=True"""})
-
-    def test_purchase_order_exception(self):
-        partner = self.env.ref('base.res_partner_1')
-        partner.zip = False
-        potest1 = self.env['base.exception.test.purchase'].create({
-            'name': 'Test base exception to basic purchase',
-            'partner_id': partner.id,
-            'line_ids': [(0, 0, {'name': "line test",
-                                 'amount': 120.0,
-                                 'qty': 1.5})],
-        })
-
-        potest1.button_confirm()
-        # Set ignore_exception flag  (Done after ignore is selected at wizard)
-        potest1.ignore_exception = True
-        potest1.button_confirm()
-        self.assertTrue(potest1.state == 'purchase')
-        # Simulation the opening of the wizard exception_confirm and
-        # set ignore_exception to True
-        except_confirm = self.exception_confirm.with_context(
+        cls.partner = cls.env["res.partner"].create({"name": "Foo"})
+        cls.po = cls.env["base.exception.test.purchase"].create(
             {
-                'active_id': potest1.id,
-                'active_ids': [potest1.id],
-                'active_model': potest1._name
-            }).new({'ignore': True})
-        except_confirm.action_confirm()
-        self.assertTrue(potest1.ignore_exception)
+                "name": "Test base exception to basic purchase",
+                "partner_id": cls.partner.id,
+                "line_ids": [
+                    (0, 0, {"name": "line test", "amount": 120.0, "qty": 1.5})
+                ],
+            }
+        )
+        cls.exception_rule = cls.env["exception.rule"].create(
+            {
+                "name": "No ZIP code on destination",
+                "sequence": 10,
+                "model": "base.exception.test.purchase",
+                "code": "if not self.partner_id.zip: failed=True",
+                "exception_type": "by_py_code",
+            }
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.loader.restore_registry()
+        super().tearDownClass()
+
+    def test_valid(self):
+        self.exception_rule.active = False
+        self.po.button_confirm()
+        self.assertFalse(self.po.exception_ids)
+
+    def test_fail_by_py(self):
+        with self.assertRaises(ValidationError):
+            self.po.button_confirm()
+        self.assertTrue(self.po.exception_ids)
+
+    def test_fail_by_domain(self):
+        self.exception_rule.write(
+            {
+                "domain": "[('partner_id.zip', '=', False)]",
+                "exception_type": "by_domain",
+            }
+        )
+        with self.assertRaises(ValidationError):
+            self.po.button_confirm()
+        self.assertTrue(self.po.exception_ids)
+
+    def test_fail_by_method(self):
+        self.exception_rule.write(
+            {
+                "method": "exception_method_no_zip",
+                "exception_type": "by_method",
+            }
+        )
+        with self.assertRaises(ValidationError):
+            self.po.button_confirm()
+        self.assertTrue(self.po.exception_ids)
+
+    def test_ignorable_exception(self):
+        # Block because of exception during validation
+        with self.assertRaises(ValidationError):
+            self.po.button_confirm()
+        # Test that we have linked exceptions
+        self.assertTrue(self.po.exception_ids)
+        # Test ignore exeception make possible for the po to validate
+        self.po.action_ignore_exceptions()
+        self.assertTrue(self.po.ignore_exception)
+        self.assertFalse(self.po.exceptions_summary)
+        self.po.button_confirm()
+        self.assertEqual(self.po.state, "purchase")
+
+    def test_blocking_exception(self):
+        self.exception_rule.is_blocking = True
+        # Block because of exception during validation
+        with self.assertRaises(ValidationError):
+            self.po.button_confirm()
+        # Test that we have linked exceptions
+        self.assertTrue(self.po.exception_ids)
+        self.assertTrue(self.po.exceptions_summary)
+        # Test cannot ignore blocked exception
+        with self.assertRaises(UserError):
+            self.po.action_ignore_exceptions()
+        self.assertFalse(self.po.ignore_exception)
+        with self.assertRaises(ValidationError):
+            self.po.button_confirm()
+        self.assertTrue(self.po.exception_ids)
+        self.assertTrue(self.po.exceptions_summary)
